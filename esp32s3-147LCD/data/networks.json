@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "networks": [
+    {
+      "ssid": "Dein_WLAN_Name",
+      "pass": "Dein_WLAN_Passwort"
+    }
+  ]
+}
