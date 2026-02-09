@@ -1,3 +1,10 @@
+/**
+ * @file main.cpp
+ * @brief Main application entry point for ESP32-S3 Mesh WLAN node with Display.
+ * 
+ * This application handles WiFi connectivity (Multi-AP), Mesh networking (painlessMesh),
+ * Configuration persistence (LittleFS/JSON), WebServer for administration, and a GUI using LVGL on an ST7789 display.
+ */
 #include <Arduino.h>
 #include <SPI.h>
 #include <SD.h>
@@ -9,7 +16,6 @@
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <painlessMesh.h>
-
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 extern "C"
@@ -17,13 +23,14 @@ extern "C"
 #include "lvgl.h"
 }
 
+// Hardware timer for LVGL ticking
 hw_timer_t *lv_timer = NULL;
 
 // =====================
 // SD Card
 // =====================
-#define SD_CS 4                // Digital I/O used
-boolean isSDAvailable = false; // Flag to indicate if SD card is available
+#define SD_CS 4             // Digital I/O used
+bool isSDAvailable = false; // Flag to indicate if SD card is available
 
 // =====================
 // MESH
@@ -37,21 +44,24 @@ boolean isSDAvailable = false; // Flag to indicate if SD card is available
 // =====================
 // CONFIG
 // =====================
-const char *CONFIG_FILE = "/networks.json";
-const int TRIGGER_PIN = 0; // temp Webserver trigger
+const char *CONFIG_FILE = "/networks.json"; // Path to the configuration file in LittleFS
+const int TRIGGER_PIN = 0; // Button pin to trigger the webserver (Boot button on many ESP32 boards)
 
 // --- GERÄTE-PROFIL ---
-bool isBatteryPowered = false; // TRUE für Sensoren (Deep Sleep), FALSE für Router/Anker
+bool isBatteryPowered = false; // TRUE for sensors (Deep Sleep), FALSE for routers/anchors (Always On)
 bool meshStarted = false;
 bool syncReceived = false;
+bool serverActive = false;
+unsigned long serverStartTime = 0;
 
 // --- OBJEKTE ---
 WiFiMulti wifiMulti;
+WiFiManager wm;
 WebServer server(80);
 painlessMesh mesh;
 Scheduler userScheduler;
 
-uint8_t lastWLANStatus = 0; // 0 = not connected, 1 = connected
+uint8_t lastWLANStatus = 0; // Cache for WLAN status: 0 = not connected, 1 = connected
 
 // WiFi connect timeout per AP. Increase when connecting takes longer.
 const uint32_t connectTimeoutMs = 10000;
@@ -104,6 +114,7 @@ static lv_disp_draw_buf_t draw_buf;
 lv_obj_t *label_time;
 lv_obj_t *label_wifi;
 
+// Interrupt Service Routine for LVGL tick
 void IRAM_ATTR lv_tick_handler()
 {
   lv_tick_inc(1);
@@ -112,6 +123,7 @@ void IRAM_ATTR lv_tick_handler()
 // =====================
 // Display Flush
 // =====================
+// Callback function for LVGL to flush the display buffer to the hardware
 void my_disp_flush(lv_disp_drv_t *disp,
                    const lv_area_t *area,
                    lv_color_t *color_p)
@@ -130,6 +142,7 @@ void my_disp_flush(lv_disp_drv_t *disp,
 // =====================
 // WLAN verbinden
 // =====================
+// Scans for networks and connects using WiFiMulti
 
 void wiFiSetup()
 {
@@ -137,11 +150,9 @@ void wiFiSetup()
   WiFi.mode(WIFI_STA);
 
   // Add list of wifi networks
-  // TODO: should be stored in non-volatile memory and added in setup() instead of hardcoded here
-
-  wifiMulti.addAP("WAP3-B5", "jps123jps");
-  wifiMulti.addAP("WAP-B5", "jps123jps");
-  wifiMulti.addAP("SMEK01", "00000000");
+  // wifiMulti.addAP("WAP3-B5", "jps123jps");
+  // wifiMulti.addAP("WAP-B5", "jps123jps");
+  // wifiMulti.addAP("SMEK01", "00000000");
 
   // WiFi.scanNetworks will return the number of networks found
   int n = WiFi.scanNetworks();
@@ -179,6 +190,7 @@ void wiFiSetup()
   }
 }
 
+// Legacy connection function (unused)
 // void wifi_connect()
 // {
 //   WiFi.begin(ssid, password);
@@ -196,6 +208,7 @@ void wiFiSetup()
 // =====================
 // Zeit aktualisieren
 // =====================
+// Updates the time label on the LVGL GUI
 void update_time()
 {
   struct tm timeinfo;
@@ -210,6 +223,7 @@ void update_time()
 // =====================
 // WLAN Status aktualisieren
 // =====================
+// Checks WiFi status and updates the GUI label with IP, SSID, and RSSI
 void update_wifi_status()
 {
   // if (WiFi.status() == WL_CONNECTED)
@@ -253,6 +267,7 @@ void updateTimeWifiStatusTask(void *pvParameters)
   }
 }
 
+// Initializes the SD card interface
 void initSD()
 {
   if (!SD.begin(SD_CS))
@@ -294,6 +309,7 @@ void initSD()
 
 // =====================
 
+// Initializes the GUI: Backlight, SPI, TFT, LVGL, Timer, and UI elements
 void initGUI()
 {
 
@@ -313,6 +329,7 @@ void initGUI()
   lv_init();
   lv_timer = timerBegin(0, 80, true); // 80 MHz / 80 = 1 MHz
 
+  // Setup timer interrupt for LVGL ticking
   timerAttachInterrupt(lv_timer, &lv_tick_handler, true);
   timerAlarmWrite(lv_timer, 1000, true); // 1 ms
   timerAlarmEnable(lv_timer);
@@ -340,41 +357,53 @@ void initGUI()
 
 // --- FUNKTIONEN: PERSISTENZ & LOGIK ---
 
+// Reads the configuration version from the local JSON file
 uint32_t getLocalVersion()
 {
   if (!LittleFS.exists(CONFIG_FILE))
     return 0;
   File f = LittleFS.open(CONFIG_FILE, "r");
   JsonDocument doc;
-  deserializeJson(doc, f);
+  DeserializationError err = deserializeJson(doc, f);
   f.close();
-  return doc["version"] | 0;
+  return (err == DeserializationError::Ok) ? doc["version"] : 0;
 }
 
+// Loads WiFi credentials from the config file into WiFiMulti
+void updateWiFiMulti()
+{
+  if (!LittleFS.exists(CONFIG_FILE))
+    return;
+  File f = LittleFS.open(CONFIG_FILE, "r");
+  JsonDocument doc;
+  deserializeJson(doc, f);
+  f.close();
+  JsonArray arr = doc["networks"].as<JsonArray>();
+  for (JsonObject n : arr)
+  {
+    wifiMulti.addAP(n["ssid"].as<const char *>(), n["pass"].as<const char *>());
+  }
+}
+
+// Saves the configuration to LittleFS and optionally broadcasts it to the Mesh
 void saveFullConfig(JsonDocument &doc, bool propagate)
 {
   File f = LittleFS.open(CONFIG_FILE, "w");
   serializeJson(doc, f);
   f.close();
+  updateWiFiMulti();
 
-  // WiFiMulti aktualisieren
-  JsonArray arr = doc["networks"].as<JsonArray>();
-  for (JsonObject net : arr)
+  if (MESH_ENABLED && meshStarted && propagate)
   {
-    wifiMulti.addAP(net["ssid"], net["pass"]);
-  }
-
-  if (MESH_ENABLED && propagate)
-  {
-    String msg;
     doc["type"] = "SYNC_RES";
+    String msg;
     serializeJson(doc, msg);
     mesh.sendBroadcast(msg);
-    Serial.println("Mesh: Neue Config verteilt!");
+    Serial.println("Mesh: Update propagiert!");
   }
 }
 
-// Einzelnes Netz hinzufügen (über Webserver/Manager)
+// Adds a single network to the configuration (via Webserver/Manager)
 void addNewNetwork(String ssid, String pass)
 {
   JsonDocument doc;
@@ -387,9 +416,11 @@ void addNewNetwork(String ssid, String pass)
 
   uint32_t currentVer = doc["version"] | 0;
   doc["version"] = currentVer + 1;
-  JsonArray arr = doc["networks"].to<JsonArray>(); // Reset/Update Array
 
-  // Einfachheitshalber: Bestehendes suchen oder neu
+  JsonArray arr = doc["networks"].as<JsonArray>();
+  if (arr.isNull())
+    arr = doc["networks"].to<JsonArray>();
+
   bool found = false;
   for (JsonObject n : arr)
   {
@@ -397,6 +428,7 @@ void addNewNetwork(String ssid, String pass)
     {
       n["pass"] = pass;
       found = true;
+      break;
     }
   }
   if (!found)
@@ -405,12 +437,12 @@ void addNewNetwork(String ssid, String pass)
     n["ssid"] = ssid;
     n["pass"] = pass;
   }
-
   saveFullConfig(doc, true);
 }
 
 // --- MESH CALLBACKS ---
 
+// Callback when a message is received via Mesh
 void receivedCallback(uint32_t from, String &msg)
 {
   JsonDocument doc;
@@ -418,26 +450,29 @@ void receivedCallback(uint32_t from, String &msg)
     return;
   String type = doc["type"];
 
+  // Handle synchronization request
   if (type == "SYNC_REQ" && !isBatteryPowered)
   {
-    // Always-On Gerät antwortet auf Anfrage
-    File f = LittleFS.open(CONFIG_FILE, "r");
-    JsonDocument res;
-    deserializeJson(res, f);
-    f.close();
-    res["type"] = "SYNC_RES";
-    String out;
-    serializeJson(res, out);
-    mesh.sendSingle(from, out);
+    if (LittleFS.exists(CONFIG_FILE))
+    {
+      File f = LittleFS.open(CONFIG_FILE, "r");
+      JsonDocument res;
+      deserializeJson(res, f);
+      f.close();
+      res["type"] = "SYNC_RES";
+      String out;
+      serializeJson(res, out);
+      mesh.sendSingle(from, out);
+    }
   }
+  // Handle synchronization response (update local config if newer version received)
   else if (type == "SYNC_RES")
   {
-    uint32_t remoteVer = doc["version"];
-    if (remoteVer > getLocalVersion())
+    if (doc["version"].as<uint32_t>() > getLocalVersion())
     {
-      Serial.printf("Update von %u erhalten (V%d). Speichere...\n", from, remoteVer);
       saveFullConfig(doc, false);
       syncReceived = true;
+      Serial.printf("Update von %u erhalten (V%d). Speichere...\n", from, doc["version"].as<uint32_t>());
     }
   }
 }
@@ -450,51 +485,98 @@ void receivedCallback(uint32_t from, String &msg)
 //     server.send(200, "text/html", html);
 // }
 
-void handleRoot()
-{
-  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<style>";
-  html += "body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; color: #333; margin: 0; padding: 20px; }";
-  html += ".container { max-width: 600px; margin: auto; }";
-  html += ".card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); margin-bottom: 20px; }";
-  html += "h1 { color: #1a73e8; font-size: 24px; margin-top: 0; }";
-  html += ".stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }";
-  html += ".stat-item { background: #e8f0fe; padding: 15px; border-radius: 8px; text-align: center; }";
-  html += ".stat-label { font-size: 12px; color: #5f6368; text-transform: uppercase; font-weight: bold; }";
-  html += ".stat-value { font-size: 20px; color: #1a73e8; font-weight: bold; }";
-  html += ".btn { display: block; width: 100%; padding: 12px; text-align: center; background: #1a73e8; color: white; border-radius: 6px; text-decoration: none; font-weight: bold; margin-top: 10px; }";
-  html += ".btn-scan { background: #34a853; }";
-  html += ".btn-reset { background: #ea4335; margin-top: 30px; font-size: 12px; padding: 8px; opacity: 0.7; }";
-  html += "</style></head><body>";
+// // Handles the root URL of the webserver, displaying status and controls
+// void handleRoot()
+// {
+//   String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+//   html += "<style>";
+//   html += "body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; color: #333; margin: 0; padding: 20px; }";
+//   html += ".container { max-width: 600px; margin: auto; }";
+//   html += ".card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); margin-bottom: 20px; }";
+//   html += "h1 { color: #1a73e8; font-size: 24px; margin-top: 0; }";
+//   html += ".stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }";
+//   html += ".stat-item { background: #e8f0fe; padding: 15px; border-radius: 8px; text-align: center; }";
+//   html += ".stat-label { font-size: 12px; color: #5f6368; text-transform: uppercase; font-weight: bold; }";
+//   html += ".stat-value { font-size: 20px; color: #1a73e8; font-weight: bold; }";
+//   html += ".btn { display: block; width: 100%; padding: 12px; text-align: center; background: #1a73e8; color: white; border-radius: 6px; text-decoration: none; font-weight: bold; margin-top: 10px; }";
+//   html += ".btn-scan { background: #34a853; }";
+//   html += ".btn-reset { background: #ea4335; margin-top: 30px; font-size: 12px; padding: 8px; opacity: 0.7; }";
+//   html += "</style></head><body>";
 
-  html += "<div class='container'>";
-  html += "<div class='card'>";
-  html += "<h1>ESP32 Swarm Node</h1>";
+//   html += "<div class='container'>";
+//   html += "<div class='card'>";
+//   html += "<h1>ESP32 Swarm Node</h1>";
 
-  // Status-Leiste
-  html += "<div class='stat-grid'>";
-  html += "<div class='stat-item'><div class='stat-label'>Config Version</div><div class='stat-value'>v" + String(getLocalVersion()) + "</div></div>";
+//   // Status-Leiste
+//   html += "<div class='stat-grid'>";
+//   html += "<div class='stat-item'><div class='stat-label'>Config Version</div><div class='stat-value'>v" + String(getLocalVersion()) + "</div></div>";
 
-  // Mesh-Knoten zählen
-  int meshNodes = (MESH_ENABLED && meshStarted) ? mesh.getNodeList().size() + 1 : 1;
-  html += "<div class='stat-item'><div class='stat-label'>Mesh Knoten</div><div class='stat-value'>" + String(meshNodes) + "</div></div>";
-  html += "</div>";
+//   // Mesh-Knoten zählen
+//   int meshNodes = (MESH_ENABLED && meshStarted) ? mesh.getNodeList().size() + 1 : 1;
+//   html += "<div class='stat-item'><div class='stat-label'>Mesh Knoten</div><div class='stat-value'>" + String(meshNodes) + "</div></div>";
+//   html += "</div>";
 
-  html += "<p><b>IP:</b> " + WiFi.localIP().toString() + "<br>";
-  html += "<b>Uptime:</b> " + String(millis() / 60000) + " min</p>";
+//   html += "<p><b>IP:</b> " + WiFi.localIP().toString() + "<br>";
+//   html += "<b>Uptime:</b> " + String(millis() / 60000) + " min</p>";
 
-  html += "<a href='/scan' class='btn btn-scan'>Neues WLAN scannen & verteilen</a>";
-  html += "<a href='/view' class='btn'>Gespeicherte Netze verwalten</a>";
-  html += "<a href='/reboot' class='btn btn-reset' onclick=\"return confirm('ESP neu starten?')\">Gerät Neustarten</a>";
-  html += "</div>";
+//   html += "<a href='/scan' class='btn btn-scan'>Neues WLAN scannen & verteilen</a>";
+//   html += "<a href='/view' class='btn'>Gespeicherte Netze verwalten</a>";
+//   html += "<a href='/reboot' class='btn btn-reset' onclick=\"return confirm('ESP neu starten?')\">Gerät Neustarten</a>";
+//   html += "</div>";
 
-  html += "</div></body></html>";
+//   html += "</div></body></html>";
 
-  server.send(200, "text/html", html);
+//   server.send(200, "text/html", html);
+// }
+
+void handleRoot() {
+    String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:sans-serif; background:#f0f2f5; padding:20px;} .card{background:white; padding:20px; border-radius:10px; box-shadow:0 2px 5px rgba(0,0,0,0.1); max-width:400px; margin:auto;} .btn{display:block; padding:10px; background:#1a73e8; color:white; text-align:center; text-decoration:none; border-radius:5px; margin:10px 0;}</style></head><body>";
+    html += "<div class='card'><h1>Swarm Node</h1>";
+    html += "<p>Version: <b>v" + String(getLocalVersion()) + "</b></p>";
+    html += "<p>Mesh Knoten: <b>" + String(mesh.getNodeList().size() + 1) + "</b></p>";
+    html += "<a href='/scan' class='btn'>WLAN Scannen</a>";
+    html += "<a href='/view' class='btn'>Netze verwalten</a>";
+    html += "<a href='/reboot' style='color:red; font-size:0.8em;'>Neustart</a></div></body></html>";
+    server.send(200, "text/html", html);
 }
 
-// --- HAUPTABLAUF ---
+void handleView() {
+    String html = "<html><body><h2>Gespeicherte Netze</h2><table border='1'><tr><th>SSID</th><th>Aktion</th></tr>";
+    if (LittleFS.exists(CONFIG_FILE)) {
+        File f = LittleFS.open(CONFIG_FILE, "r");
+        JsonDocument doc; deserializeJson(doc, f); f.close();
+        JsonArray arr = doc["networks"].as<JsonArray>();
+        for (int i=0; i<arr.size(); i++) {
+            html += "<tr><td>" + arr[i]["ssid"].as<String>() + "</td><td><a href='/delete?id=" + String(i) + "'>Löschen</a></td></tr>";
+        }
+    }
+    html += "</table><br><a href='/'>Zurück</a></body></html>";
+    server.send(200, "text/html", html);
+}
 
+void handleScan() {
+    int n = WiFi.scanNetworks();
+    String html = "<html><body><h2>Verfügbare Netze</h2><table border='1'>";
+    for (int i = 0; i < n; ++i) {
+        html += "<tr><td>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)</td>";
+        html += "<td><form action='/add' method='POST'><input type='hidden' name='s' value='"+WiFi.SSID(i)+"'><input type='password' name='p'><input type='submit' value='Hinzufügen'></form></td></tr>";
+    }
+    html += "</table><br><a href='/'>Zurück</a></body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleDelete() {
+    if (server.hasArg("id")) {
+        JsonDocument doc;
+        File f = LittleFS.open(CONFIG_FILE, "r"); deserializeJson(doc, f); f.close();
+        doc["networks"].as<JsonArray>().remove(server.arg("id").toInt());
+        doc["version"] = doc["version"].as<uint32_t>() + 1;
+        saveFullConfig(doc, true);
+    }
+    server.sendHeader("Location", "/view"); server.send(303);
+}
+
+// Sets up Mesh, Filesystem, WiFiManager, and Webserver routes
 void setupMeshEtAL()
 {
 
@@ -502,63 +584,55 @@ void setupMeshEtAL()
 
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
 
-  // 1. Lokale Netze in WiFiMulti laden
-  uint32_t ver = getLocalVersion();
-  if (ver > 0)
+  if (!LittleFS.begin(true))
   {
-    File f = LittleFS.open(CONFIG_FILE, "r");
-    JsonDocument doc;
-    deserializeJson(doc, f);
-    f.close();
-    for (JsonObject n : doc["networks"].as<JsonArray>())
-      wifiMulti.addAP(n["ssid"], n["pass"]);
+    Serial.println("FS Error");
+    return;
   }
 
-  // 2. Erster Connect-Versuch
-  if (wifiMulti.run() != WL_CONNECTED)
-  {
-    if (MESH_ENABLED)
-    {
-      Serial.println("WiFi Fail. Suche Mesh Sync...");
-      mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
-      mesh.onReceive(&receivedCallback);
-      meshStarted = true;
+  // 1. Initialisiere WiFi & Multi
+  updateWiFiMulti();
 
-      // Sync Request senden
-      unsigned long start = millis();
-      while (!syncReceived && millis() - start < 15000)
-      {
-        if (millis() % 3000 == 0)
-        {
-          JsonDocument req;
-          req["type"] = "SYNC_REQ";
-          String r;
-          serializeJson(req, r);
-          mesh.sendBroadcast(r);
-        }
-        mesh.update();
-        delay(1);
-      }
-    }
-  }
+  // 2. Prepare WiFiManager (Non-Blocking)
+  wm.setConfigPortalBlocking(false);
+  wm.setConfigPortalTimeout(180);
 
-  // 3. Fallback auf WiFiManager (nur für Always-On)
-  if (WiFi.status() != WL_CONNECTED && !isBatteryPowered)
+  // 3. Prepare Mesh
+  if (MESH_ENABLED)
   {
-    WiFiManager wm;
-    if (wm.autoConnect("ESP32_SWARM_INITIAL"))
-    {
-      addNewNetwork(WiFi.SSID(), WiFi.psk());
-    }
-  }
-
-  // Always-On Mesh permanent starten
-  if (MESH_ENABLED && !meshStarted && !isBatteryPowered)
-  {
+    mesh.setDebugMsgTypes(ERROR | STARTUP);
     mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
     mesh.onReceive(&receivedCallback);
     mesh.stationManual(MESH_PREFIX, MESH_PASSWORD);
     meshStarted = true;
+  }
+
+  // 4. Attempt Connection
+  if (wifiMulti.run() != WL_CONNECTED)
+  {
+    Serial.println("WiFiMulti fehlgeschlagen. Starte Mesh-Sync...");
+
+    // Try to get data via Mesh for 10 seconds
+    unsigned long start = millis();
+    while (!syncReceived && millis() - start < 10000)
+    {
+      if (millis() % 3000 == 0)
+      {
+        JsonDocument req;
+        req["type"] = "SYNC_REQ";
+        String r;
+        serializeJson(req, r);
+        mesh.sendBroadcast(r);
+      }
+      mesh.update();
+      delay(1);
+    }
+
+    // If still no WLAN, open WiFiManager AP
+    if (WiFi.status() != WL_CONNECTED && !isBatteryPowered)
+    {
+      wm.startConfigPortal("ESP32_SWARM_AP");
+    }
   }
 
   server.on("/", handleRoot);
@@ -569,7 +643,7 @@ void setupMeshEtAL()
     delay(1000);
     ESP.restart(); });
 
-  // Hier weitere Routen (Scan, Delete etc. wie oben) einfügen
+  // Add more routes here (Scan, Delete etc.)
 }
 
 // =====================
@@ -579,7 +653,7 @@ void setup()
   Serial.begin(115200);
 
   // SD Card
-  initSD();
+  // initSD();
 
   initGUI();
 
@@ -603,35 +677,55 @@ void setup()
 
 void loop()
 {
-  lv_timer_handler();
+  lv_timer_handler(); // Handle LVGL tasks
 
+  wm.process(); // WiFiManager background tasks
   if (meshStarted)
     mesh.update();
-  server.handleClient(); // Webserver bedienen
+  if (serverActive)
+    server.handleClient();
 
-  // Button für Webserver
-  if (digitalRead(TRIGGER_PIN) == LOW)
-  {
-    server.begin();
-    Serial.println("Webserver gestartet!");
-    delay(1000);
-  }
+  // WiFiManager Success Check: If connected in AP mode, save creds and switch to STA
+    static bool apWasActive = false;
+    if (WiFi.status() == WL_CONNECTED && WiFi.getMode() & WIFI_AP) {
+        Serial.println("Verbunden! Schalte AP aus.");
+        addNewNetwork(WiFi.SSID(), WiFi.psk());
+        WiFi.mode(WIFI_STA); // AP deaktivieren
+    }
+    
+    
+  // Webserver Trigger (Button): Start admin server on button press
+    if (digitalRead(TRIGGER_PIN) == LOW) {
+        delay(50);
+        if (!serverActive) {
+            server.begin();
+            serverActive = true;
+            serverStartTime = millis();
+            Serial.println("Webserver gestartet!");
+        }
+    }
 
-  // Batterie-Logik: Schlafen wenn fertig
+// Admin-Server Timeout: Stop server after 5 minutes of inactivity
+    if (serverActive && millis() - serverStartTime > 300000) {
+        server.stop();
+        serverActive = false;
+    }
+
+// WiFi Reconnect Logic: Check connection every 20 seconds
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck > 20000) {
+        if (WiFi.status() != WL_CONNECTED) wifiMulti.run();
+        lastCheck = millis();
+    }
+
+  // Battery Logic: Sleep when finished or after timeout
   if (isBatteryPowered && (WiFi.status() == WL_CONNECTED || millis() > 60000))
   {
-    Serial.println("Going to sleep...");
+    Serial.println("atterie-Modus:Going to sleep...");
     ESP.deepSleep(600e6); // 10 Min
   }
-
-  static unsigned long lastWiFiCheck = 0;
-  if (millis() - lastWiFiCheck > 30000)
-  {
-    if (WiFi.status() != WL_CONNECTED)
-      wifiMulti.run();
-    lastWiFiCheck = millis();
-  }
-
+  
+  // Periodic UI update (every 1 second)
   static uint32_t last = 0;
   if (millis() - last > 1000)
   {
