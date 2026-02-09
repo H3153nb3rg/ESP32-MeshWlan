@@ -20,7 +20,7 @@ Boot-Phase:
 Der ESP32 lädt alle JSON-Einträge.
 WiFiMulti versucht eine Verbindung.
 
-Bedarfsfall AP: Schlägt dies fehl, übernimmt WiFiManager und erstellt den AP "ESP32_Wiederherstellung". In diesem Moment kannst du dich mit dem Handy verbinden und die Ersteinrichtung machen.
+Bedarfsfall AP: Schlägt dies fehl, übernimmt WiFiManager und erstellt den AP "ESP32_SWARM_NET". In diesem Moment kannst du dich mit dem Handy verbinden und die Ersteinrichtung machen.
 
 Im Betrieb:
 
