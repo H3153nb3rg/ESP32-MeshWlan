@@ -1,7 +1,7 @@
 /**
  * @file main.cpp
  * @brief Main application entry point for ESP32-S3 Mesh WLAN node with Display.
- * 
+ *
  * This application handles WiFi connectivity (Multi-AP), Mesh networking (painlessMesh),
  * Configuration persistence (LittleFS/JSON), WebServer for administration, and a GUI using LVGL on an ST7789 display.
  */
@@ -18,6 +18,8 @@
 #include <painlessMesh.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <qrcode.h>
+
 extern "C"
 {
 #include "lvgl.h"
@@ -41,17 +43,25 @@ bool isSDAvailable = false; // Flag to indicate if SD card is available
 #define MESH_PASSWORD "meshpassword123"
 #define MESH_PORT 5555
 
+// PING LED PIN
+#define LED_PIN 2 // Standard ESP32 DevKit LED
+
+// =====================
+// ACCESS POINT
+// =====================
+#define ESP32_SWARM_AP "ESP32_SWARM_AP"
+
 // =====================
 // CONFIG
 // =====================
 const char *CONFIG_FILE = "/networks.json"; // Path to the configuration file in LittleFS
-const int TRIGGER_PIN = 0; // Button pin to trigger the webserver (Boot button on many ESP32 boards)
+const int TRIGGER_PIN = 0;                  // Button pin to trigger the webserver (Boot button on many ESP32 boards)
 
 // --- GERÄTE-PROFIL ---
 bool isBatteryPowered = false; // TRUE for sensors (Deep Sleep), FALSE for routers/anchors (Always On)
 bool meshStarted = false;
 bool syncReceived = false;
-bool serverActive = false;
+bool webserverActive = false;
 unsigned long serverStartTime = 0;
 
 // --- OBJEKTE ---
@@ -148,11 +158,6 @@ void wiFiSetup()
 {
 
   WiFi.mode(WIFI_STA);
-
-  // Add list of wifi networks
-  // wifiMulti.addAP("WAP3-B5", "jps123jps");
-  // wifiMulti.addAP("WAP-B5", "jps123jps");
-  // wifiMulti.addAP("SMEK01", "00000000");
 
   // WiFi.scanNetworks will return the number of networks found
   int n = WiFi.scanNetworks();
@@ -442,6 +447,13 @@ void addNewNetwork(String ssid, String pass)
 
 // --- MESH CALLBACKS ---
 
+void blinkLED()
+{
+  digitalWrite(LED_PIN, HIGH);
+  delay(500); // Kurz leuchten
+  digitalWrite(LED_PIN, LOW);
+}
+
 // Callback when a message is received via Mesh
 void receivedCallback(uint32_t from, String &msg)
 {
@@ -449,6 +461,13 @@ void receivedCallback(uint32_t from, String &msg)
   if (deserializeJson(doc, msg))
     return;
   String type = doc["type"];
+
+  // Handle custom command (e.g., "BLINK_CMD") to trigger LED blinking
+  if (type == "BLINK_CMD")
+  {
+    Serial.println("Blink-Befehl erhalten!");
+    blinkLED();
+  }
 
   // Handle synchronization request
   if (type == "SYNC_REQ" && !isBatteryPowered)
@@ -477,8 +496,77 @@ void receivedCallback(uint32_t from, String &msg)
   }
 }
 
+// Funktion zum Senden des Befehls
+void sendBlinkCommand()
+{
+  JsonDocument doc;
+  doc["type"] = "BLINK_CMD";
+  String msg;
+  serializeJson(doc, msg);
+  mesh.sendBroadcast(msg);
+  blinkLED(); // Auch die eigene LED blinken lassen
+}
+
 // --- WEB SERVER ---
 
+// --- MESH RSSI HELPER ---
+// Erstellt eine Liste der Nachbarn mit Signalstärke
+// Hilfsfunktion für die Balkenanzeige
+
+String getRSSILevel(int rssi)
+{
+  if (rssi > -55)
+    return "<span style='color:#34a853;'>▂▄▆█</span>"; // Exzellent
+  if (rssi > -70)
+    return "<span style='color:#fbbc04;'>▂▄▆</span><span style='color:#ccc;'>█</span>"; // Gut
+  if (rssi > -85)
+    return "<span style='color:#ea4335;'>▂▄</span><span style='color:#ccc;'>▆█</span>"; // Schwach
+  return "<span style='color:#ea4335;'>▂</span><span style='color:#ccc;'>▄▆█</span>";   // Sehr schwach
+}
+
+String getMeshStatusHTML()
+{
+  String out = "<div class='mesh-list'><b>Mesh Status:</b><br>";
+  out += "• Local ID: " + String(mesh.getNodeId()) + "<br>";
+
+  String json = mesh.subConnectionJson();
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, json);
+
+  if (!error && doc.is<JsonArray>())
+  {
+    JsonArray subNodes = doc.as<JsonArray>();
+
+    if (subNodes.size() == 0)
+    {
+      out += "<i style='color:gray;'>Suche Nachbarn...</i><br>";
+    }
+
+    for (JsonObject node : subNodes)
+    {
+      uint32_t id = node["nodeId"];
+      int rssi = node["rssi"] | -100; // Standardwert falls nicht vorhanden
+
+      out += "• Node: " + String(id) + " " + getRSSILevel(rssi);
+      out += " <small>(" + String(rssi) + " dBm)</small><br>";
+    }
+  }
+  else
+  {
+    // Fallback: Wenn JSON noch leer ist, zeige einfache Liste
+    std::list<uint32_t> nodeList = mesh.getNodeList();
+    for (uint32_t node : nodeList)
+    {
+      if (node != mesh.getNodeId())
+      {
+        out += "• Node: " + String(node) + " <span style='color:gray;'>▂▄▆█</span><br>";
+      }
+    }
+  }
+
+  out += "</div>";
+  return out;
+}
 // void handleRoot() {
 //     String html = "<h1>Swarm Admin</h1><p>Version: " + String(getLocalVersion()) + "</p>";
 //     html += "<a href='/scan'>Scan New WiFi</a>";
@@ -522,6 +610,7 @@ void receivedCallback(uint32_t from, String &msg)
 //   html += "<a href='/scan' class='btn btn-scan'>Neues WLAN scannen & verteilen</a>";
 //   html += "<a href='/view' class='btn'>Gespeicherte Netze verwalten</a>";
 //   html += "<a href='/reboot' class='btn btn-reset' onclick=\"return confirm('ESP neu starten?')\">Gerät Neustarten</a>";
+
 //   html += "</div>";
 
 //   html += "</div></body></html>";
@@ -529,51 +618,135 @@ void receivedCallback(uint32_t from, String &msg)
 //   server.send(200, "text/html", html);
 // }
 
-void handleRoot() {
-    String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:sans-serif; background:#f0f2f5; padding:20px;} .card{background:white; padding:20px; border-radius:10px; box-shadow:0 2px 5px rgba(0,0,0,0.1); max-width:400px; margin:auto;} .btn{display:block; padding:10px; background:#1a73e8; color:white; text-align:center; text-decoration:none; border-radius:5px; margin:10px 0;}</style></head><body>";
-    html += "<div class='card'><h1>Swarm Node</h1>";
-    html += "<p>Version: <b>v" + String(getLocalVersion()) + "</b></p>";
-    html += "<p>Mesh Knoten: <b>" + String(mesh.getNodeList().size() + 1) + "</b></p>";
-    html += "<a href='/scan' class='btn'>WLAN Scannen</a>";
-    html += "<a href='/view' class='btn'>Netze verwalten</a>";
-    html += "<a href='/reboot' style='color:red; font-size:0.8em;'>Neustart</a></div></body></html>";
-    server.send(200, "text/html", html);
+// void handleRoot() {
+//     String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'><style>body{font-family:sans-serif; background:#f0f2f5; padding:20px;} .card{background:white; padding:20px; border-radius:10px; box-shadow:0 2px 5px rgba(0,0,0,0.1); max-width:400px; margin:auto;} .btn{display:block; padding:10px; background:#1a73e8; color:white; text-align:center; text-decoration:none; border-radius:5px; margin:10px 0;}</style></head><body>";
+//     html += "<div class='card'><h1>Swarm Node</h1>";
+//     html += "<p>Version: <b>v" + String(getLocalVersion()) + "</b></p>";
+//     html += "<p>Mesh Knoten: <b>" + String(mesh.getNodeList().size() + 1) + "</b></p>";
+//     html += "<a href='/scan' class='btn'>WLAN Scannen</a>";
+//     html += "<a href='/view' class='btn'>Netze verwalten</a>";
+//     html += "<a href='/reboot' style='color:red; font-size:0.8em;'>Neustart</a></div></body></html>";
+//     server.send(200, "text/html", html);
+// }
+
+void handleRoot()
+{
+  String url = "http://" + WiFi.localIP().toString();
+  if (WiFi.status() != WL_CONNECTED)
+    url = "http://192.168.4.1";
+
+  String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  // QR Code Script (Browser-Seite)
+  html += "<script src='https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js'></script>";
+
+  html += "<style>";
+  html += "body{font-family:sans-serif; background:#f4f7f9; text-align:center; padding:10px;}";
+  html += ".card{background:white; padding:20px; border-radius:15px; box-shadow:0 4px 10px rgba(0,0,0,0.1); max-width:400px; margin:auto;}";
+  html += ".btn{display:block; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:8px; margin:10px 0; font-weight:bold;}";
+  html += ".mesh-list{text-align:left; font-size:0.85em; background:#eee; padding:10px; border-radius:8px; margin:15px 0; border-left:4px solid #1a73e8;}";
+  html += "#qrcode{display:flex; justify-content:center; margin:20px;}";
+  html += "</style></head><body>";
+
+  html += "<div class='card'><h1>Swarm Admin</h1>";
+  html += "<p>Config Version: <b>v" + String(getLocalVersion()) + "</b></p>";
+
+  // QR Code Container
+  html += "<div id='qrcode'></div>";
+
+  // Mesh Status mit RSSI
+  html += getMeshStatusHTML();
+
+  html += "<a href='/scan' class='btn' style='background:#34a853;'>WLAN Scannen</a>";
+  html += "<a href='/view' class='btn'>Netzwerke verwalten</a>";
+  html += "<a href='/blink' class='btn' style='background:#fbbc04; color:black;'>Alle Knoten finden (Blink)</a>";
+  html += "<p style='font-size:0.7em; color:gray;'>IP: " + url + "</p>";
+
+  // JS für QR Code Generierung im Browser
+  html += "<script>new QRCode(document.getElementById('qrcode'), {text:'" + url + "', width:140, height:140, colorDark:'#000000', colorLight:'#ffffff'});</script>";
+  html += "</div></body></html>";
+
+  server.send(200, "text/html", html);
 }
 
-void handleView() {
-    String html = "<html><body><h2>Gespeicherte Netze</h2><table border='1'><tr><th>SSID</th><th>Aktion</th></tr>";
-    if (LittleFS.exists(CONFIG_FILE)) {
-        File f = LittleFS.open(CONFIG_FILE, "r");
-        JsonDocument doc; deserializeJson(doc, f); f.close();
-        JsonArray arr = doc["networks"].as<JsonArray>();
-        for (int i=0; i<arr.size(); i++) {
-            html += "<tr><td>" + arr[i]["ssid"].as<String>() + "</td><td><a href='/delete?id=" + String(i) + "'>Löschen</a></td></tr>";
-        }
+void handleView()
+{
+  String html = "<html><body><h2>Gespeicherte Netze</h2><table border='1'><tr><th>SSID</th><th>Aktion</th></tr>";
+  if (LittleFS.exists(CONFIG_FILE))
+  {
+    File f = LittleFS.open(CONFIG_FILE, "r");
+    JsonDocument doc;
+    deserializeJson(doc, f);
+    f.close();
+    JsonArray arr = doc["networks"].as<JsonArray>();
+    for (int i = 0; i < arr.size(); i++)
+    {
+      html += "<tr><td>" + arr[i]["ssid"].as<String>() + "</td><td><a href='/delete?id=" + String(i) + "'>Löschen</a></td></tr>";
     }
-    html += "</table><br><a href='/'>Zurück</a></body></html>";
-    server.send(200, "text/html", html);
+  }
+  html += "</table><br><a href='/'>Zurück</a></body></html>";
+  server.send(200, "text/html", html);
 }
 
-void handleScan() {
-    int n = WiFi.scanNetworks();
-    String html = "<html><body><h2>Verfügbare Netze</h2><table border='1'>";
-    for (int i = 0; i < n; ++i) {
-        html += "<tr><td>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)</td>";
-        html += "<td><form action='/add' method='POST'><input type='hidden' name='s' value='"+WiFi.SSID(i)+"'><input type='password' name='p'><input type='submit' value='Hinzufügen'></form></td></tr>";
-    }
-    html += "</table><br><a href='/'>Zurück</a></body></html>";
-    server.send(200, "text/html", html);
+void handleScan()
+{
+  int n = WiFi.scanNetworks();
+  String html = "<html><body><h2>Verfügbare Netze</h2><table border='1'>";
+  for (int i = 0; i < n; ++i)
+  {
+    html += "<tr><td>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)</td>";
+    html += "<td><form action='/add' method='POST'><input type='hidden' name='s' value='" + WiFi.SSID(i) + "'><input type='password' name='p'><input type='submit' value='Hinzufügen'></form></td></tr>";
+  }
+  html += "</table><br><a href='/'>Zurück</a></body></html>";
+  server.send(200, "text/html", html);
 }
 
-void handleDelete() {
-    if (server.hasArg("id")) {
-        JsonDocument doc;
-        File f = LittleFS.open(CONFIG_FILE, "r"); deserializeJson(doc, f); f.close();
-        doc["networks"].as<JsonArray>().remove(server.arg("id").toInt());
-        doc["version"] = doc["version"].as<uint32_t>() + 1;
-        saveFullConfig(doc, true);
+void handleDelete()
+{
+  if (server.hasArg("id"))
+  {
+    JsonDocument doc;
+    File f = LittleFS.open(CONFIG_FILE, "r");
+    deserializeJson(doc, f);
+    f.close();
+    doc["networks"].as<JsonArray>().remove(server.arg("id").toInt());
+    doc["version"] = doc["version"].as<uint32_t>() + 1;
+    saveFullConfig(doc, true);
+  }
+  server.sendHeader("Location", "/view");
+  server.send(303);
+}
+
+void printQRCode()
+{
+  String url = "http://" + WiFi.localIP().toString() + '/';
+
+  // QR-Code Struktur initialisieren
+  QRCode qrcode;
+  uint8_t qrcodeData[qrcode_getBufferSize(3)];
+  qrcode_initText(&qrcode, qrcodeData, 3, 0, url.c_str());
+
+  Serial.println("\n--- Scan zum Öffnen des Web-Interface ---");
+
+  // Um den QR-Code im Serial Monitor weiß auf schwarz darzustellen
+  // nutzen wir zwei Zeilen für die Vertikale, um die Proportionen zu halten
+  for (uint8_t y = 0; y < qrcode.size; y++)
+  {
+    Serial.print("  "); // Linker Rand
+    for (uint8_t x = 0; x < qrcode.size; x++)
+    {
+      if (qrcode_getModule(&qrcode, x, y))
+      {
+        Serial.print("\u2588\u2588"); // Schwarzes Quadrat (Unicode Full Block)
+      }
+      else
+      {
+        Serial.print("  "); // Weißes Quadrat
+      }
     }
-    server.sendHeader("Location", "/view"); server.send(303);
+    Serial.println();
+  }
+  Serial.println("URL: " + url);
+  Serial.println("------------------------------------------\n");
 }
 
 // Sets up Mesh, Filesystem, WiFiManager, and Webserver routes
@@ -583,6 +756,9 @@ void setupMeshEtAL()
   LittleFS.begin(true);
 
   pinMode(TRIGGER_PIN, INPUT_PULLUP);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   if (!LittleFS.begin(true))
   {
@@ -631,7 +807,7 @@ void setupMeshEtAL()
     // If still no WLAN, open WiFiManager AP
     if (WiFi.status() != WL_CONNECTED && !isBatteryPowered)
     {
-      wm.startConfigPortal("ESP32_SWARM_AP");
+      wm.startConfigPortal(ESP32_SWARM_AP);
     }
   }
 
@@ -643,7 +819,16 @@ void setupMeshEtAL()
     delay(1000);
     ESP.restart(); });
 
-  // Add more routes here (Scan, Delete etc.)
+  server.on("/blink", []()
+            {
+              sendBlinkCommand();
+              server.sendHeader("Location", "/");
+              server.send(303); // Zurück zur Hauptseite
+            });
+
+  server.on("/view", handleView);
+  server.on("/scan", handleScan);
+  server.on("/delete", handleDelete);
 }
 
 // =====================
@@ -682,41 +867,56 @@ void loop()
   wm.process(); // WiFiManager background tasks
   if (meshStarted)
     mesh.update();
-  if (serverActive)
+  if (webserverActive)
     server.handleClient();
 
   // WiFiManager Success Check: If connected in AP mode, save creds and switch to STA
-    static bool apWasActive = false;
-    if (WiFi.status() == WL_CONNECTED && WiFi.getMode() & WIFI_AP) {
-        Serial.println("Verbunden! Schalte AP aus.");
-        addNewNetwork(WiFi.SSID(), WiFi.psk());
-        WiFi.mode(WIFI_STA); // AP deaktivieren
-    }
-    
-    
+  static bool apWasActive = false;
+  if (WiFi.status() == WL_CONNECTED && WiFi.getMode() & WIFI_AP)
+  {
+    Serial.println("Verbunden! Schalte AP aus.");
+    addNewNetwork(WiFi.SSID(), WiFi.psk());
+    WiFi.mode(WIFI_STA); // AP deaktivieren
+  }
+
   // Webserver Trigger (Button): Start admin server on button press
-    if (digitalRead(TRIGGER_PIN) == LOW) {
-        delay(50);
-        if (!serverActive) {
-            server.begin();
-            serverActive = true;
-            serverStartTime = millis();
-            Serial.println("Webserver gestartet!");
-        }
-    }
+  if (digitalRead(TRIGGER_PIN) == LOW)
+  {
+    delay(50);
+    if (!webserverActive)
+    {
+      server.begin();
+      webserverActive = true;
+      serverStartTime = millis();
+      Serial.println("Webserver gestartet!");
 
-// Admin-Server Timeout: Stop server after 5 minutes of inactivity
-    if (serverActive && millis() - serverStartTime > 300000) {
-        server.stop();
-        serverActive = false;
+      // RUFE HIER DEN QR-CODE AUF
+      if (WiFi.status() == WL_CONNECTED)
+      {
+        printQRCode();
+      }
+      else
+      {
+        Serial.println("IP: 192.168.4.1 (Portal Modus)");
+      }
     }
+  }
 
-// WiFi Reconnect Logic: Check connection every 20 seconds
-    static unsigned long lastCheck = 0;
-    if (millis() - lastCheck > 20000) {
-        if (WiFi.status() != WL_CONNECTED) wifiMulti.run();
-        lastCheck = millis();
-    }
+  // Admin-Server Timeout: Stop server after 5 minutes of inactivity
+  if (webserverActive && millis() - serverStartTime > 300000)
+  {
+    server.stop();
+    webserverActive = false;
+  }
+
+  // WiFi Reconnect Logic: Check connection every 20 seconds
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 20000)
+  {
+    if (WiFi.status() != WL_CONNECTED)
+      wifiMulti.run();
+    lastCheck = millis();
+  }
 
   // Battery Logic: Sleep when finished or after timeout
   if (isBatteryPowered && (WiFi.status() == WL_CONNECTED || millis() > 60000))
@@ -724,7 +924,7 @@ void loop()
     Serial.println("atterie-Modus:Going to sleep...");
     ESP.deepSleep(600e6); // 10 Min
   }
-  
+
   // Periodic UI update (every 1 second)
   static uint32_t last = 0;
   if (millis() - last > 1000)
