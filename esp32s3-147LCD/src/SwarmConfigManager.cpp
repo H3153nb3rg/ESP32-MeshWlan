@@ -103,6 +103,7 @@ void SwarmConfigManager::updateWiFiMulti() {
     JsonDocument doc;
     deserializeJson(doc, f);
     f.close();
+    
     JsonArray arr = doc["networks"].as<JsonArray>();
     for (JsonObject n : arr) {
         _wifiMulti.addAP(n["ssid"].as<const char*>(), n["pass"].as<const char*>());
