@@ -17,6 +17,9 @@ SwarmConfigManager::SwarmConfigManager(bool batteryPowered, const char* meshPref
 
 void SwarmConfigManager::setup() {
     Serial.begin(115200);
+
+    Serial.println("--- SETUP Start");
+    
     pinMode(LED_PIN, OUTPUT);
     pinMode(TRIGGER_PIN, INPUT_PULLUP);
     
@@ -32,6 +35,8 @@ void SwarmConfigManager::setup() {
     _mesh.stationManual(_meshPrefix, _meshPass);
     _meshStarted = true;
 
+    Serial.println("--- MESH initialized");
+    
     if (_wifiMulti.run() != WL_CONNECTED) {
         unsigned long start = millis();
         while(!_syncReceived && millis() - start < 10000) {
@@ -40,9 +45,11 @@ void SwarmConfigManager::setup() {
                 String r; serializeJson(req, r); _mesh.sendBroadcast(r);
             }
             _mesh.update();
+            Serial.println("--- MESH request send");
             delay(1);
         }
         if (WiFi.status() != WL_CONNECTED && !_isBatteryPowered) {
+            Serial.println("--- AP Mode");
             _wm.startConfigPortal("ESP32_SWARM_AP");
         }
     }
@@ -53,17 +60,22 @@ void SwarmConfigManager::setup() {
     _server.on("/delete", [this](){ handleDelete(); });
     _server.on("/add", HTTP_POST, [this](){ handleAdd(); });
     _server.on("/blink", [this](){ sendBlinkCommand(); _server.sendHeader("Location", "/"); _server.send(303); });
-    // _server.on("/reboot", [](){ _instance->_server.send(200, "text/plain", "Rebooting..."); delay(500); ESP.restart(); });
+    _server.on("/reboot", [](){ _instance->_server.send(200, "text/plain", "Rebooting..."); delay(500); ESP.restart(); });
+
+    Serial.println("--- SETUP Done");
 }
 
 void SwarmConfigManager::loop() {
+    
     _wm.process();
+    
     if (_meshStarted) _mesh.update();
     if (_serverActive) _server.handleClient();
 
     if (WiFi.status() == WL_CONNECTED && WiFi.getMode() & WIFI_AP) {
         addNewNetwork(WiFi.SSID(), WiFi.psk());
         WiFi.mode(WIFI_STA);
+        Serial.println("--- Wifi in use: "+WiFi.SSID());
     }
 
     if (digitalRead(TRIGGER_PIN) == LOW) {
@@ -73,6 +85,7 @@ void SwarmConfigManager::loop() {
             _serverActive = true;
             _serverStartTime = millis();
             printSerialQRCode("http://" + WiFi.localIP().toString());
+            Serial.println("--- Webserver started");
         }
     }
 
@@ -106,6 +119,7 @@ void SwarmConfigManager::updateWiFiMulti() {
     JsonArray arr = doc["networks"].as<JsonArray>();
     for (JsonObject n : arr) {
         _wifiMulti.addAP(n["ssid"].as<const char*>(), n["pass"].as<const char*>());
+        Serial.println("WifiMulti ssid added:"+n["ssid"].as<const char*>());
     }
 }
 
@@ -152,12 +166,13 @@ void SwarmConfigManager::meshReceivedWrapper(uint32_t from, String &msg) {
             _instance->saveFullConfig(doc, false);
             _instance->_syncReceived = true;
         }
-    } else if (doc["type"] == "BLINK_CMD") {
+    } else if (doc["type"] == "BLINK_CMD") {            
         _instance->blinkLED();
     }
 }
 
 void SwarmConfigManager::blinkLED() {
+    Serial.println("Blink LED");
     digitalWrite(LED_PIN, HIGH);
     delay(500);
     digitalWrite(LED_PIN, LOW);
@@ -181,12 +196,14 @@ String SwarmConfigManager::getMeshStatusHTML() {
     for (JsonObject node : subNodes) {
         int rssi = node["rssi"] | -100;
         out += "• Node: " + node["nodeId"].as<String>() + " " + getRSSILevel(rssi) + " <small>(" + String(rssi) + ")</small><br>";
+        Serial.println("Web ssid found :"+node["nodeId"].as<String>());
     }
     out += "</div>";
     return out;
 }
 
 void SwarmConfigManager::handleRoot() {
+    Serial.println("Web -- rootpage");
     String url = "http://" + WiFi.localIP().toString();
     String html = "<html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1'>";
     html += "<script src='https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js'></script>";
@@ -201,6 +218,7 @@ void SwarmConfigManager::handleRoot() {
 }
 
 void SwarmConfigManager::handleScan() {
+    Serial.println("Web -- scanpage");
     int n = WiFi.scanNetworks();
     String html = "<html><body><h2>Scan Results</h2><table border='1'>";
     for (int i = 0; i < n; ++i) {
@@ -211,6 +229,7 @@ void SwarmConfigManager::handleScan() {
 }
 
 void SwarmConfigManager::handleView() {
+    Serial.println("Web -- viewpage");
     String html = "<html><body><h2>Networks</h2><ul>";
     if (LittleFS.exists(CONFIG_FILE)) {
         File f = LittleFS.open(CONFIG_FILE, "r");
@@ -223,6 +242,7 @@ void SwarmConfigManager::handleView() {
 }
 
 void SwarmConfigManager::handleDelete() {
+    Serial.println("Web -- deletepage");
     if (_server.hasArg("id")) {
         JsonDocument doc;
         File f = LittleFS.open(CONFIG_FILE, "r"); deserializeJson(doc, f); f.close();
@@ -234,11 +254,13 @@ void SwarmConfigManager::handleDelete() {
 }
 
 void SwarmConfigManager::handleAdd() {
+    Serial.println("Web -- addpage");
     if(_server.hasArg("s") && _server.hasArg("p")) addNewNetwork(_server.arg("s"), _server.arg("p"));
     _server.sendHeader("Location", "/"); _server.send(303);
 }
 
 void SwarmConfigManager::printSerialQRCode(String url) {
+    Serial.println("print QR:");
     QRCode qrcode;
     uint8_t qrcodeData[qrcode_getBufferSize(3)];
     qrcode_initText(&qrcode, qrcodeData, 3, 0, url.c_str());
